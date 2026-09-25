@@ -1,0 +1,40 @@
+[project]
+name = "manager-agent"
+version = "0.1.0"
+description = "LangGraph manager agent + 10-agent GPT debate panel with streamed debate events and a structured final answer"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+  "langgraph>=1.0",
+  "langchain-core>=1.0",
+  "langchain-openai>=1.0",
+  "tavily-python>=0.5.0",
+  "pydantic>=2.0",
+  "pydantic-settings>=2.0",
+  "python-dotenv>=1.0.0",
+  "httpx>=0.27.0",
+  "arxiv>=2.1.0",
+  "pypdf>=4.0.0",
+  "pandas>=2.0.0",
+  "fastapi>=0.110",
+  "uvicorn[standard]>=0.29",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0", "httpx>=0.27"]
+sandbox = ["e2b-code-interpreter>=2.0"]  # enables panel code_runner
+# memory = ["chromadb>=0.5.0"]  # add when the memory tool is wired
+
+[project.scripts]
+manager-agent = "manager_agent.main:main"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src", "tests"]
