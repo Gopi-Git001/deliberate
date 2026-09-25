@@ -29,10 +29,15 @@ class PanelSettings(BaseSettings):
     # and how many regenerations a rejected turn gets before it is accepted as degraded.
     panel_restatement_threshold: float = 0.6
     panel_turn_retries: int = 1
-    panel_research_tool_steps: int = 3
-    panel_debate_tool_steps: int = 1
+    # Tool steps per turn. Several tools can run in one step; a tool that needs another's output
+    # (source_ranker on search results) needs a later step, so budgets below 3 starve the vetting tools.
+    panel_research_tool_steps: int = 5
+    panel_debate_tool_steps: int = 3
+    panel_retry_tool_steps: int = 1  # rewrite of a rejected debate turn
     panel_max_concurrency: int = 5  # parallel agent LLM calls
     panel_summary_max_chars: int = 1200
+    # Print every panel tool call (args + raw result) to stderr live, plus a per-agent summary.
+    panel_tool_trace: bool = True
 
     @property
     def model(self) -> str:

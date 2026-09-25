@@ -78,17 +78,47 @@ def rank_sources(sources: list[dict], query: str = "") -> list[dict]:
     return sorted(ranked, key=lambda r: r["score"], reverse=True)
 
 
+_RESULT_LINE = re.compile(r"^\s*[-*]?\s*(.+?):\s+(https?://[^\s;,)\]]+)[;,)\]]?\s*(.*)$")
+
+
+def parse_search_results(text: str) -> list[dict]:
+    """Parse web_search output ('- Title: url' then indented snippet lines) into sources.
+
+    Agents often re-paste it with the snippet on the URL line ('- Title: url  snippet'); accept that too.
+    """
+    sources: list[dict] = []
+    for line in text.splitlines():
+        m = _RESULT_LINE.match(line)
+        if m:
+            sources.append({"title": m.group(1).strip(), "url": m.group(2), "snippet": m.group(3).strip()})
+        elif sources and line.startswith("  "):
+            sources[-1]["snippet"] = f"{sources[-1]['snippet']} {line.strip()}".strip()
+    return sources
+
+
+def parse_sources(sources: str) -> list[dict]:
+    """Accept a JSON list of {title, url, snippet?} or raw web_search output."""
+    try:
+        parsed = json.loads(sources)
+    except (ValueError, TypeError):
+        return parse_search_results(sources or "")
+    if isinstance(parsed, dict):
+        parsed = [parsed]
+    return [s for s in parsed if isinstance(s, dict)] if isinstance(parsed, list) else []
+
+
 @tool
-def source_ranker(sources_json: str, query: str = "") -> str:
+def source_ranker(sources: str, query: str = "") -> str:
     """Rank sources by credibility and relevance.
 
-    sources_json: JSON list of {"title", "url", "snippet"?}. Returns the list sorted
-    by score (0-1) with credibility, relevance, and the reason.
+    sources: the raw output of web_search (paste it as-is), or a JSON list of
+    {"title", "url", "snippet"?}. Returns the sources sorted by score (0-1) with
+    credibility, relevance, and the reason.
     """
-    try:
-        sources = json.loads(sources_json)
-        if not isinstance(sources, list):
-            raise ValueError("expected a JSON list")
-    except (ValueError, TypeError) as exc:
-        return f"source_ranker error: sources_json must be a JSON list of objects ({exc})"
-    return json.dumps(rank_sources([s for s in sources if isinstance(s, dict)], query), ensure_ascii=False)
+    parsed = parse_sources(sources)
+    if not parsed:
+        return (
+            "source_ranker error: no sources found — pass web_search output as-is or a JSON list "
+            'of {"title", "url", "snippet"}'
+        )
+    return json.dumps(rank_sources(parsed, query), ensure_ascii=False)
