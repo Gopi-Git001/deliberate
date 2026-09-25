@@ -218,5 +218,6 @@ manager-agent/
 │       └── tools/                  # PANEL_TOOLS (8)
 ├── web/                            # React + Vite frontend (see web/README.md)
 ├── docs/screenshots/
+├── docs/briefs/                   # the build specs this project follows
 └── tests/                          # offline suite + opt-in live smoke
 ```
