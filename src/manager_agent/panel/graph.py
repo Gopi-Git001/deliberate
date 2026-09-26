@@ -31,6 +31,7 @@ from manager_agent.panel.nodes import (
     summarize_round,
 )
 from manager_agent.panel.state import PanelState
+from manager_agent.panel.trace import tracing
 from manager_agent.schemas import PanelBrief, PanelResult
 
 
@@ -98,21 +99,27 @@ def _result(state: dict[str, Any]) -> PanelResult:
     )
 
 
+def _trace_label(brief: PanelBrief) -> str:
+    return f"panel hop {brief.hop}: {brief.goal[:80]}"
+
+
 def run_panel(brief: PanelBrief) -> PanelResult:
     """PanelRunner for the manager. Debate events stream to any enclosing stream."""
     panel_llm.get_panel_llm()  # fail fast on a missing key before any fan-out
-    return _result(panel_app.invoke(_inputs(brief), config=_run_config()))
+    with tracing(_trace_label(brief), get_panel_settings().panel_tool_trace):
+        return _result(panel_app.invoke(_inputs(brief), config=_run_config()))
 
 
 def stream_panel(brief: PanelBrief) -> Iterator[dict[str, Any]]:
     """Run the panel solo, yielding debate events; the last event is `panel_result`."""
     panel_llm.get_panel_llm()
     final: dict[str, Any] = {}
-    for mode, chunk in panel_app.stream(
-        _inputs(brief), config=_run_config(), stream_mode=["custom", "values"]
-    ):
-        if mode == "custom":
-            yield chunk
-        else:
-            final = chunk
+    with tracing(_trace_label(brief), get_panel_settings().panel_tool_trace):
+        for mode, chunk in panel_app.stream(
+            _inputs(brief), config=_run_config(), stream_mode=["custom", "values"]
+        ):
+            if mode == "custom":
+                yield chunk
+            else:
+                final = chunk
     yield {"type": "panel_result", "result": _result(final).model_dump()}

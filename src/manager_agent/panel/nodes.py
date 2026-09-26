@@ -3,6 +3,7 @@ rounds (engaged debate → summarize → stop?) → settle."""
 
 from __future__ import annotations
 
+import json
 import logging
 import re
 import math
@@ -18,7 +19,7 @@ from manager_agent.panel.clones import agent_id_for, make_panel
 from manager_agent.panel.config import get_panel_settings
 from manager_agent.panel.schemas import AgentTurn, ConsensusStatement, DebateTurn, RoundDigest
 from manager_agent.panel.state import PanelState
-from manager_agent.panel.tools.citation import make_citation
+from manager_agent.panel.tools.citation import make_citation, normalize_url
 from manager_agent.panel.tools.confidence_scorer import score_confidence
 from manager_agent.panel.tools.perspective_shifter import shift_brief
 from manager_agent.panel.tools.source_ranker import rank_sources
@@ -67,11 +68,17 @@ def _record(
     shifted: bool,
     check: TurnCheck | None = None,
     attempts: int = 1,
+    usage: list[dict] | None = None,
 ) -> dict:
-    """Normalize a turn: clean citations, score sources, calibrate confidence, track engagement."""
+    """Normalize a turn: clean citations, score sources, calibrate confidence, track engagement.
+
+    Where the agent ranked a source itself (source_ranker), its score is used for that citation.
+    """
+    usage = usage or []
     cites = [make_citation(c.title, c.url, c.quote) for c in turn.citations]
-    ranked = rank_sources(cites, question)
-    avg_source = sum(r["score"] for r in ranked) / len(ranked) if ranked else 0.0
+    agent_scores = _agent_source_scores(usage)
+    ranked = [agent_scores.get(r["url"], r["score"]) if r["url"] else r["score"] for r in rank_sources(cites, question)]
+    avg_source = sum(ranked) / len(ranked) if ranked else 0.0
     conf = score_confidence(turn.self_confidence, len(cites), avg_source)
     rec = {
         "agent_id": agent_id,
@@ -99,6 +106,9 @@ def _record(
         "engagement_failed": False,
         "validation_failures": [],
         "attempts": attempts,
+        "tools_used": dict(Counter(u["tool"] for u in usage)),
+        "agent_ranked_sources": sum(1 for c in cites if c["url"] in agent_scores),
+        "agent_confidence": _agent_confidence(usage),
     }
     if isinstance(turn, DebateTurn) and check is not None:
         rec.update(
@@ -116,6 +126,34 @@ def _record(
             research_similarity=check.research_similarity,
         )
     return rec
+
+
+def _tool_json(usage: list[dict], tool: str) -> list:
+    """Parsed JSON results of one tool's successful calls, in call order."""
+    out = []
+    for u in usage:
+        if u["tool"] == tool and not u["error"]:
+            try:
+                out.append(json.loads(u["result"]))
+            except (ValueError, TypeError):
+                pass
+    return out
+
+
+def _agent_source_scores(usage: list[dict]) -> dict[str, float]:
+    """url -> score from every source_ranker call the agent made (latest wins)."""
+    scores = {}
+    for ranked in _tool_json(usage, "source_ranker"):
+        for r in ranked if isinstance(ranked, list) else []:
+            if isinstance(r, dict) and r.get("url") and "score" in r:
+                scores[normalize_url(r["url"])] = float(r["score"])
+    return scores
+
+
+def _agent_confidence(usage: list[dict]) -> float | None:
+    """The agent's last confidence_scorer score, if it called the tool."""
+    scored = [r["score"] for r in _tool_json(usage, "confidence_scorer") if isinstance(r, dict) and "score" in r]
+    return scored[-1] if scored else None
 
 
 def _note(rec: dict) -> str:
@@ -146,6 +184,7 @@ def _agent_event(rec: dict) -> dict:
         "engagement_failed": rec["engagement_failed"],
         "validation_failures": rec["validation_failures"],
         "attempts": rec["attempts"],
+        "tools_used": rec["tools_used"],
     }
 
 
@@ -209,18 +248,45 @@ def route_after_intake(state: PanelState):
     ]
 
 
+# Tools each turn type must call before answering (only those the agent actually has count).
+RESEARCH_REQUIRED_TOOLS = ("web_search", "source_ranker", "citation", "confidence_scorer")
+DEBATE_REQUIRED_TOOLS = ("web_search", "source_ranker", "perspective_shifter", "confidence_scorer")
+
+RESEARCH_WORKFLOW = """RESEARCH ROUND — gather and vet evidence for your focus, then give your initial position on
+the DEBATE QUESTION with citations. Work in steps:
+1. web_search (2-3 targeted queries{documents}).
+2. source_ranker on the search output (paste it as-is, with the DEBATE QUESTION as query); summarizer
+   if a result or document is long.
+3. citation for each source you will rely on; confidence_scorer with your self-rating, citation count
+   and the average source_ranker score of those sources.
+You MUST call web_search, source_ranker, citation and confidence_scorer before answering."""
+
+DEBATE_WORKFLOW = """TOOLS THIS ROUND — verify before you argue:
+1. web_search to check the specific peer claims/sources you will contest or accept, and
+   perspective_shifter on the strongest position opposing yours (steelman it before deciding).
+2. source_ranker on your new search output (paste it as-is).
+3. confidence_scorer with your self-rating, citation count, average source score and the share of
+   peers who agree with you; use its score as self_confidence.
+You MUST call web_search, source_ranker, perspective_shifter and confidence_scorer before answering."""
+
+
 def research_agent(payload: dict) -> dict:
     settings = get_panel_settings()
     agent_id = payload["agent_id"]
     agent = make_panel(payload["panel_size"])[int(agent_id.rsplit("_", 1)[1])]
-    task = (
-        f"{_context(payload, agent_id)}\n\n"
-        "RESEARCH ROUND: gather evidence for your focus (web_search, document_reader; "
-        "rank with source_ranker; normalize with citation), then give your initial "
-        "position on the DEBATE QUESTION with citations."
+    has_docs = any(t.name == "document_reader" for t in agent.tools)
+    task = f"{_context(payload, agent_id)}\n\n" + RESEARCH_WORKFLOW.format(
+        documents="; document_reader for relevant local documents" if has_docs else ""
     )
-    turn = agent.take_turn(task, settings.panel_research_tool_steps, _config(agent_id, "research", 0))
-    rec = _record(agent_id, 0, turn, payload["sub_question"], shifted=False)
+    usage: list[dict] = []
+    turn = agent.take_turn(
+        task,
+        settings.panel_research_tool_steps,
+        _config(agent_id, "research", 0),
+        required_tools=RESEARCH_REQUIRED_TOOLS,
+        usage=usage,
+    )
+    rec = _record(agent_id, 0, turn, payload["sub_question"], shifted=False, usage=usage)
     _emit(_agent_event(rec))
     return {"agent_outputs": [rec], "notes": {agent_id: [_note(rec)]}}
 
@@ -385,6 +451,7 @@ def _debate_task(payload: dict, agent_id: str, r: int, research: dict | None, pr
         "question alone; use the digest only as background."
         if r > 1 else ""
     )
+    parts.append(DEBATE_WORKFLOW)
     parts.append(DEBATE_CONTRACT.format(round2=round2))
     return "\n\n".join(parts)
 
@@ -401,13 +468,26 @@ def debate_agent(payload: dict) -> dict:
     task = _debate_task(payload, agent_id, r, research, prior, shift)
 
     attempts, rejection = 0, ""
+    usage: list[dict] = []
     while True:
         attempts += 1
         prompt = task if not rejection else (
             f"{task}\n\nYOUR PREVIOUS DRAFT WAS REJECTED:\n{rejection}\nRewrite the whole turn to fix these problems."
         )
-        steps = settings.panel_debate_tool_steps if attempts == 1 else 0
-        turn: DebateTurn = agent.take_turn(prompt, steps, _config(agent_id, "debate", r), schema=DebateTurn)
+        # A rejected draft is a rewrite: short tool budget, no required tools.
+        first = attempts == 1
+        steps = settings.panel_debate_tool_steps if first else settings.panel_retry_tool_steps
+        attempt_usage: list[dict] = []
+        turn: DebateTurn = agent.take_turn(
+            prompt,
+            steps,
+            _config(agent_id, "debate", r),
+            schema=DebateTurn,
+            attempt=attempts,
+            required_tools=DEBATE_REQUIRED_TOOLS if first else (),
+            usage=attempt_usage,
+        )
+        usage += attempt_usage
         check = check_turn(
             turn,
             agent_id=agent_id,
@@ -421,7 +501,7 @@ def debate_agent(payload: dict) -> dict:
         _emit({"type": "turn_rejected", "agent_id": agent_id, "round": r, "reasons": check.reasons, "attempt": attempts})
         rejection = feedback(check.reasons)
 
-    rec = _record(agent_id, r, turn, payload["sub_question"], bool(shift), check, attempts)
+    rec = _record(agent_id, r, turn, payload["sub_question"], bool(shift), check, attempts, usage)
     _emit(_agent_event(rec))
     return {"agent_outputs": [rec], "notes": {agent_id: [_note(rec)]}}
 
